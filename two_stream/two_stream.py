@@ -8,8 +8,8 @@ import torchvision.models as models
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.preprocessing import MinMaxScaler
-
-
+from sklearn.metrics import r2_score
+import torch.nn.functional as F
 class ThreeStreamDataset(Dataset):
     def __init__(self, rgb_root_dir,flow_root_dir,sift_root_dir,new_size,transform=None):
         self.rgb_root_dir=rgb_root_dir
@@ -105,7 +105,7 @@ class ThreeStreamDataset(Dataset):
         sift_list=sift_list[:,:,random_frame]
         if self.transform:
             sift_list = self.transform(sift_list)
-
+#三個輸入，兩個輸出： 隨機抽取的1幀，隨機抽取的2幀光流，3幀的SIFT descriptor; 分類類別，能見度值
         return frame_cropped ,flows,sift_list, label,torch.tensor(float(vis_num.iloc[0]),dtype=torch.float)
 
 rgb_root_dir='./video_class'
@@ -132,46 +132,57 @@ for frame,flow,sift, labels,vis_num  in train_loader:
     break
 
 
-class ResNetCustom(nn.Module):
-    def __init__(self, num_classes):  # 添加回歸輸出的數量
-        super(ResNetCustom, self).__init__()
-        # 加載預設的resnet18模型
-        self.resnet18 = models.resnet50(pretrained=True)
-        # 修改第一層以接受20通道的輸入
-        self.resnet18.conv1 = nn.Conv2d(num_frame, 64, kernel_size=3, stride=2, padding=3, bias=False)
-        # self.resnet18.bn1 = nn.BatchNorm2d(64)
-        # 替換分類層以符合目標類別數量
-        num_ftrs = self.resnet18.fc.in_features
+class CustomBranch(nn.Module):
+    def __init__(self, num_classes, in_channel, branch_name):
+        super(CustomBranch, self).__init__()
+        self.branch_name=branch_name
+        # 加載選擇的backbone
+        if self.branch_name == 'resnet50':
+            self.backbone = models.resnet50(pretrained=True)
+            # 調整第一層的輸入channel
+            self.backbone.conv1 = nn.Conv2d(in_channel, 64, kernel_size=3, stride=2, padding=3, bias=False)
+            num_ftrs = self.backbone.fc.in_features
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+        elif self.branch_name == 'ShuffleNetV2':
+            self.backbone = models.shufflenet_v2_x0_5(pretrained=True)
+            self.backbone.conv1[0]= nn.Conv2d(in_channel, 24, kernel_size=3, stride=2, padding=1, bias=False)
+            # 添加AdaptiveAvgPool2d以使輸出形狀固定
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            num_ftrs = self.backbone.fc.in_features
+            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
+        elif self.branch_name == 'MobileNetV2':
+            self.backbone = models.mobilenet_v2(pretrained=True)
+            self.backbone.features[0][0] = nn.Conv2d(in_channel, 32, kernel_size=3, stride=2, padding=1, bias=False)
+            num_ftrs = self.backbone.classifier[1].in_features
+            # 保存特徵提取部分
+            self.feature_extractor = nn.Sequential(*list(self.backbone.features))
+        else:
+            raise ValueError("Unsupported backbone model.")
 
-        # 保存特徵提取部分
-        self.feature_extractor = nn.Sequential(*list(self.resnet18.children())[:-1])
-
-        # 定義分類分支
         self.classification_branch = nn.Linear(num_ftrs, num_classes)
-
-        # 定義回歸分支
         self.regression_branch = nn.Linear(num_ftrs, 1)
 
     def forward(self, x):
-        # 提取特徵
+        # Feature extraction
         x = self.feature_extractor(x)
+        if self.branch_name == 'ShuffleNetV2':
+            x = self.avgpool(x)
         x = x.view(x.size(0), -1)
 
-        # 分類輸出
+        # Classification output
         class_output = self.classification_branch(x)
 
-        # 回歸輸出
+        # Regression output (sigmoid for probability-like output)
         reg_output = F.sigmoid(self.regression_branch(x))
-        #reg_output = self.regression_branch(x)
 
         return class_output, reg_output
 
 class ThreeStream(nn.Module):
     def __init__(self,num_classes,optical_channels,sift_channels):
-        super(TwoStream,self).__init__()
-        self.SpatialModel = ResNetCustom(num_classes=num_classes,in_channel=3)
-        self.OpticalModel= ResNetCustom(num_classes=num_classes,in_channel=optical_channels)
-        self.siftModel= ResNetCustom(num_classes=num_classes,in_channel=sift_channels)
+        super(ThreeStream,self).__init__()
+        self.SpatialModel = CustomBranch(num_classes=num_classes,in_channel=3,branch_name='ShuffleNetV2')
+        self.OpticalModel= CustomBranch(num_classes=num_classes,in_channel=optical_channels,branch_name='resnet50')
+        self.siftModel= CustomBranch(num_classes=num_classes,in_channel=sift_channels,branch_name='ShuffleNetV2')
 
         # 初始化可學習權重
         self.class_weights = nn.Parameter(torch.ones(3))
@@ -187,18 +198,18 @@ class ThreeStream(nn.Module):
 
         # 將logit1, logit2和logit3根據正規化後的權重進行組合
         logit = weights1[0] * logit1 + weights1[1] * logit2 + weights1[2] * logit3
-        reg = weights1[0] * reg1 + weights1[1] * reg2 + weights1[2] * reg3
+        reg = weights2[0] * reg1 + weights2[1] * reg2 + weights2[2] * reg3
         return logit,reg
 
 def train(model, train_loader, criterion,criterion2,optimizer, device):
     model.train()
     running_loss = 0.0
-    for inputs, labels, vis_num in train_loader:
-        inputs, labels, vis_num = inputs.to(device), labels.to(device),vis_num.to(device)
+    for inputs1,inputs2,inputs3, labels, vis_num in train_loader:
+        inputs1,inputs2,inputs3, labels, vis_num = inputs1.to(device),inputs2.to(device),inputs3.to(device), labels.to(device),vis_num.to(device)
 
         optimizer.zero_grad()
 
-        outputs1,outputs2 = model(inputs)
+        outputs1,outputs2 = model(inputs1,inputs2,inputs3)
         loss1 = criterion(outputs1, labels)
         loss2 = criterion2(outputs2.reshape((-1,1)),vis_num.reshape((-1,1)))
 
@@ -206,7 +217,7 @@ def train(model, train_loader, criterion,criterion2,optimizer, device):
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item() * inputs.size(0)
+        running_loss += loss.item() * inputs1.size(0)
 
     epoch_loss = running_loss / len(train_loader.dataset)
     return epoch_loss
@@ -220,15 +231,15 @@ def test(model, test_loader, criterion,criterion2, device):
     all_labels = []
     all_outputs2 = []
     with torch.no_grad():
-        for inputs, labels, vis_num in test_loader:
-            inputs, labels, vis_num = inputs.to(device), labels.to(device),vis_num.to(device)
+        for inputs1,inputs2,inputs3, labels, vis_num in test_loader:
+            inputs1,inputs2,inputs3, labels, vis_num = inputs1.to(device),inputs2.to(device),inputs3.to(device), labels.to(device),vis_num.to(device)
 
-            outputs1, outputs2 = model(inputs)
+            outputs1, outputs2 = model(inputs1,inputs2,inputs3)
             loss1 = criterion(outputs1, labels)
             loss2 = criterion2(outputs2.reshape((-1,1)), vis_num.reshape((-1,1)))
 
             loss = loss1 + loss2
-            running_loss += loss.item() * inputs.size(0)
+            running_loss += loss.item() * inputs1.size(0)
             _, predicted = torch.max(torch.softmax(outputs1,1), 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
@@ -243,25 +254,40 @@ def test(model, test_loader, criterion,criterion2, device):
     r2 = r2_score(all_labels, all_outputs2)
     return epoch_loss, accuracy,r2
 
+def load_checkpoint(model, optimizer, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    return model, optimizer, epoch, loss
+def save_checkpoint(model, optimizer, epoch, loss, checkpoint_path):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, checkpoint_path)
 
 # 創建模型實例
-model = TwoStream(num_classes=3,optical_channels=20)
+model = ThreeStream(num_classes=3,optical_channels=2,sift_channels=3)
+pretrained_model_path=None
 # 計算模型參數量
 total_params = sum(p.numel() for p in model.parameters())
-
-
-
-
 print(f'Total number of parameters: {total_params}')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
+
+
 criterion = nn.CrossEntropyLoss()
+criterion2 = nn.HuberLoss()
 
 # lr=0.0001
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
 scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=0)
-
+if pretrained_model_path is not None:
+    model, optimizer, start_epoch, loss = load_checkpoint(model, optimizer, pretrained_model_path)
 # 設置追蹤最佳模型的變數
 best_accuracy = 0.0
 best_epoch = 0
@@ -269,14 +295,15 @@ best_model_path = "best_model.pth"
 
 num_epochs = 100
 for epoch in range(num_epochs):
-    train_loss = train(model, train_loader, criterion, optimizer, device)
-    test_loss, test_accuracy= test(model, test_loader, criterion, device)
+    train_loss = train(model, train_loader, criterion,criterion2, optimizer, device)
+    test_loss, test_accuracy,r2 = test(model, test_loader, criterion,criterion2, device)
     # 在每個epoch結束時更新學習率
     #scheduler.step()
     print(
-        f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f} ")
-    if test_accuracy> best_accuracy:
-        best_accuracy = test_accuracy
+        f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f},r2:{r2:.4f} ")
+    if test_accuracy+r2> best_accuracy:
+        best_accuracy = test_accuracy+r2
         best_epoch = epoch
+        #save_checkpoint(model, optimizer, num_epochs, test_loss, best_model_path)
         torch.save(model.state_dict(), best_model_path)
         print(f"New best model saved with accuracy: {best_accuracy:.4f} at epoch {best_epoch + 1}")
