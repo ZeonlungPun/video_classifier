@@ -70,8 +70,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="extract optical flows")
     parser.add_argument("--src_dir", type=str, default='./video_class', help='path to the video data')
     parser.add_argument("--out_dir", type=str, default='./flow', help='path to store frames and optical flow')
-    parser.add_argument("--new_width", type=int, default=200, help='resize image width')
-    parser.add_argument("--new_height", type=int, default=400, help='resize image height')
+    parser.add_argument("--new_width", type=int, default=600, help='resize image width')
+    parser.add_argument("--new_height", type=int, default=200, help='resize image height')
     parser.add_argument("--num_worker", type=int, default=8, help='number of workers')
     parser.add_argument("--ext", type=str, default='avi', choices=['avi', 'mp4'], help='video file extensions')
 
@@ -81,7 +81,7 @@ if __name__ == '__main__':
     src_path = args.src_dir
     num_worker = args.num_worker
     ext = args.ext
-    new_size = (args.new_width, args.new_height)
+    new_size = ( args.new_height,args.new_width)
 
     if not os.path.isdir(out_path):
         print(f"Creating folder: {out_path}")
