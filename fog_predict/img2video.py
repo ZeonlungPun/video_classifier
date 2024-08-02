@@ -2,8 +2,8 @@ import os
 import cv2
 
 # 設置來源文件夾和目標文件夾
-source_dir = '/home/punzeonlung/fog_paper/input'
-output_video_dir = '/home/punzeonlung/fog_paper/input_video'
+source_dir = '/home/kingargroo/fog/frames'
+output_video_dir = '/home/kingargroo/fog/video'
 
 # 創建目標文件夾，如果不存在的話
 os.makedirs(output_video_dir, exist_ok=True)

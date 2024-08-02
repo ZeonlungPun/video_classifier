@@ -4,13 +4,12 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torch.nn as nn
+import torchvision.models as models
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import r2_score
 import torch.nn.functional as F
-from torchinfo import summary
-
 class ThreeStreamDataset(Dataset):
     def __init__(self, rgb_root_dir,flow_root_dir,sift_root_dir,new_size,transform=None):
         self.rgb_root_dir=rgb_root_dir
@@ -89,8 +88,8 @@ class ThreeStreamDataset(Dataset):
 
         flows = np.concatenate([flowx, flowy], axis=2)  # Stack flow x and y
         #任意選擇兩幀光流
-        random_frame = np.random.permutation(flows.shape[2])[:2]
-        flows = flows[:, :, random_frame]
+        random_frame = random.randint(0, flows.shape[2] - 2)
+        flows = flows[:, :, random_frame:(random_frame + 2)]
         if self.transform:
             flows = self.transform(flows)
 
@@ -102,7 +101,7 @@ class ThreeStreamDataset(Dataset):
             sift_=np.expand_dims(np.load(final_sift_path),2)
             sift_list.append(sift_)
         sift_list= np.concatenate(sift_list, axis=-1)
-        random_frame = np.random.permutation(sift_list.shape[2])[:5]
+        random_frame = np.random.permutation(sift_list.shape[2])[:3]
         sift_list=sift_list[:,:,random_frame]
         if self.transform:
             sift_list = self.transform(sift_list)
@@ -116,7 +115,7 @@ sift_root_dir='./SIFT'
 transform = transforms.Compose([
     transforms.ToTensor()
 ])
-
+#new_size=(height,wdith)
 dataset = ThreeStreamDataset(rgb_root_dir,flow_root_dir,sift_root_dir,new_size=(200,600), transform=transform)
 train_size = int(0.7 * len(dataset))
 val_size= int(0.15*len(dataset))
@@ -136,110 +135,88 @@ for frame,flow,sift, labels,vis_num  in train_loader:
     break
 
 
+class CustomBranch(nn.Module):
+    def __init__(self, num_classes, in_channel):
+        super(CustomBranch, self).__init__()
 
-class Block1(nn.Module):
-    def __init__(self,in_channels):
-        super(Block1, self).__init__()
-        #block1 ,FOR SIFT NET
-        self.conv1_1 = nn.Conv2d(in_channels, 64, kernel_size=1, stride=1, padding=0)
-        self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2, padding=1)
-    def forward(self, x):
+        # 加載選擇的backbone
+        self.backbone = models.shufflenet_v2_x0_5(pretrained=True)
 
-        x=self.conv1_1(x)
-        x=self.conv1_2(x)
-        x=self.pool1(x)
-        return x
+        self.backbone.conv1[0] = nn.Conv2d(in_channel, 24, kernel_size=3, stride=2, padding=1, bias=False)
 
+        # 添加AdaptiveAvgPool2d以使輸出形狀固定
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        num_ftrs =  1024
+        self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
 
-class Block2(nn.Module):
-    def __init__(self):
-        super(Block2, self).__init__()
-        # block2, for flow net
-        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=1, stride=1, padding=0)
-        self.conv2_2 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=0)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2, padding=1)
-
-    def forward(self, x0):
-        x = self.conv2_1(x0)
-        x = self.conv2_2(x)
-        x = self.pool2(x)
-        return x
-
-
-class Block3(nn.Module):
-    def __init__(self):
-        super(Block3, self).__init__()
-        # block3,for rgb net
-        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=1, stride=1, padding=0)
-        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=0)
-        self.conv3_3 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2, padding=1)
+        self.classification_branch = nn.Linear(num_ftrs, num_classes)
+        self.regression_branch = nn.Linear(num_ftrs, 1)
 
     def forward(self, x):
-        x = self.conv3_1(x)
-        x = self.conv3_2(x)
-        x = self.conv3_3(x)
-        x = self.pool3(x)
+        # Feature extraction
+        x_mid = self.feature_extractor(x)
+        x = self.avgpool(x_mid)
+        x = x.view(x.size(0), -1)
 
-        return x
+        return x, x_mid  # 返回最終特徵和中間特徵
+
+class ThreeStream(nn.Module):
+    def __init__(self, num_classes, optical_channels, sift_channels):
+        super(ThreeStream, self).__init__()
+        self.SpatialModel = CustomBranch(num_classes=num_classes, in_channel=3)
+        self.OpticalModel = CustomBranch(num_classes=num_classes, in_channel=optical_channels)
+        self.SiftModel = CustomBranch(num_classes=num_classes, in_channel=sift_channels)
+
+        self.class_weights = nn.Parameter(torch.ones(3))
+        self.reg_weights = nn.Parameter(torch.ones(3))
+
+        # Ensure the same number of output channels for all branches
+        self.conv_spatial_to_optical = nn.Conv2d(1024, 1024, kernel_size=1)
+        self.conv_optical_to_spatial = nn.Conv2d(1024, 1024, kernel_size=1)
+        self.conv_sift_to_spatial = nn.Conv2d(1024, 1024, kernel_size=1)
+        self.conv_sift_to_optical = nn.Conv2d(1024, 1024, kernel_size=1)
+
+    def forward(self, x1, x2, x3):
+        features1, intermediate_features1_ = self.OpticalModel(x2)
+        features2, intermediate_features2_ = self.SpatialModel(x1)
+        features3, intermediate_features3_ = self.SiftModel(x3)
+
+        # Adding horizontal connections in convolutional layers
+        #Spatial TO Optical
+        intermediate_features1 = intermediate_features1_ + self.conv_spatial_to_optical(intermediate_features2_)
+        #optical to spatial
+        intermediate_features2_1 = intermediate_features2_ + self.conv_optical_to_spatial(intermediate_features1_)
+        #sift to optical
+        intermediate_features3_ = F.interpolate(intermediate_features3_, size=intermediate_features1_.shape[2:])
+        intermediate_features3 = intermediate_features3_ + self.conv_sift_to_optical(intermediate_features3_)
+        #sift to spatial
+        intermediate_features3_ = F.interpolate(intermediate_features3_, size=intermediate_features2_.shape[2:])
+        intermediate_features2_2 = intermediate_features3_ + self.conv_sift_to_spatial(intermediate_features3_)
+
+        # Pass through the rest of the feature extractor
+        final_features1 = self.OpticalModel.avgpool(intermediate_features1+intermediate_features3_)
+        final_features1 = final_features1.view(final_features1.size(0), -1)+features1
+        final_features2 = self.SpatialModel.avgpool(intermediate_features2_1+intermediate_features2_2)
+        final_features2 = final_features2.view(final_features2.size(0), -1)+features2
 
 
-class VisNet(nn.Module):
-    def __init__(self,sift_channels,flow_channels,rgb_channels,num_classes):
-        super(VisNet, self).__init__()
-        self.stream1_b1 = Block1(sift_channels)
-        self.stream2_b1 = Block1(flow_channels)
-        self.stream3_b1 = Block1(rgb_channels)
-        self.stream1_b2 = Block2()
-        self.stream2_b2 = Block2()
-        self.stream3_b2 = Block2()
-        self.stream1_b3 = Block3()
-        self.stream2_b3 = Block3()
-        self.stream3_b3 = Block3()
+        # Classification and regression branches
+        class_output1 = self.OpticalModel.classification_branch(features1)
+        class_output2 = self.SpatialModel.classification_branch(features2)
+        class_output3 = self.SiftModel.classification_branch(features3)
+        reg_output1 = F.sigmoid(self.OpticalModel.regression_branch(final_features1))
+        reg_output2 = F.sigmoid(self.SpatialModel.regression_branch(final_features2))
+        reg_output3 = F.sigmoid(self.SiftModel.regression_branch(features3))
 
-        self.avg_poo1= nn.AdaptiveAvgPool2d(1)
-        self.avg_poo2=nn.AdaptiveAvgPool2d(1)
-        self.fc=nn.Linear(256,128)
-        self.classification_branch = nn.Linear(128, num_classes)
-        self.regression_branch = nn.Linear(128, 1)
+        # 使用softmax来正规化权重
+        weights1 = nn.functional.softmax(self.class_weights, dim=0)
+        weights2 = nn.functional.softmax(self.reg_weights, dim=0)
 
+        # 将logit1, logit2和logit3根据正规化后的权重进行组合
+        logit = weights1[0] * class_output1 + weights1[1] * class_output2 + weights1[2] * class_output3
+        reg = weights2[0] * reg_output1 + weights2[1] * reg_output2 + weights2[2] * reg_output3
 
-    def forward(self,x1,x2,x3):
-        #x {stream}_{block}
-        #stage 1 FOR SIFT NET
-        x1_1= self.stream1_b1(x1)
-        x2_1= self.stream2_b1(x2)
-        x3_1= F.relu(self.stream3_b1(x3))
-        x23_1=x2_1+x3_1
-        x23_1_=F.interpolate(x23_1,size=x1_1.shape[2:])
-        x1_1=x23_1_+x1_1
-
-        #stage 2 for flow net
-        x1_2 = self.stream1_b2(x1_1)
-        x2_2 = self.stream2_b2(x23_1)
-        x3_2 = F.relu(self.stream3_b2(x23_1))
-        x23_2=x2_2+x3_2
-        x23_2_=F.interpolate(x23_2,size=x1_2.shape[2:])
-        x1_2=x23_2_+x1_2
-
-
-        #stage 3 for RGB
-        x1_3=self.stream1_b3(x1_2)
-        x2_3=self.stream2_b3(x23_2)
-        x3_3=F.relu(self.stream3_b3(x23_2))
-        x23_3=x2_3+x3_3
-
-        x1_3=self.avg_poo1(x1_3).view(x1_3.shape[0],-1)
-        x23_3=self.avg_poo2(x23_3).view(x23_3.shape[0],-1)
-
-        x_new=x1_3+x23_3
-        x_new=F.relu(self.fc(x_new))
-        reg=F.sigmoid(self.regression_branch(x_new))
-        logit=self.classification_branch(x_new)
-
-        return  logit,reg
-
+        return logit, reg
 def train(model, train_loader, criterion,criterion2,optimizer, device):
     model.train()
     running_loss = 0.0
@@ -248,7 +225,7 @@ def train(model, train_loader, criterion,criterion2,optimizer, device):
 
         optimizer.zero_grad()
 
-        outputs1,outputs2 = model(inputs3,inputs2,inputs1)
+        outputs1,outputs2 = model(inputs1,inputs2,inputs3)
         loss1 = criterion(outputs1, labels)
         loss2 = criterion2(outputs2.reshape((-1,1)),vis_num.reshape((-1,1)))
 
@@ -262,23 +239,21 @@ def train(model, train_loader, criterion,criterion2,optimizer, device):
     return epoch_loss
 
 
-def test(model, test_loader, criterion,criterion2,criterion3, device):
+def test(model, test_loader, criterion,criterion2, device):
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
-    total_mse=0
     all_labels = []
     all_outputs2 = []
     with torch.no_grad():
         for inputs1,inputs2,inputs3, labels, vis_num in test_loader:
             inputs1,inputs2,inputs3, labels, vis_num = inputs1.to(device),inputs2.to(device),inputs3.to(device), labels.to(device),vis_num.to(device)
 
-            outputs1, outputs2 = model(inputs3,inputs2,inputs1)
+            outputs1, outputs2 = model(inputs1,inputs2,inputs3)
             loss1 = criterion(outputs1, labels)
             loss2 = criterion2(outputs2.reshape((-1,1)), vis_num.reshape((-1,1)))
-            mse= criterion3(outputs2.reshape((-1,1)), vis_num.reshape((-1,1))).item()
-            total_mse +=mse
+
             loss = loss1 + loss2
             running_loss += loss.item() * inputs1.size(0)
             _, predicted = torch.max(torch.softmax(outputs1,1), 1)
@@ -288,12 +263,12 @@ def test(model, test_loader, criterion,criterion2,criterion3, device):
             # Collect all true and predicted values for R2 calculation
             all_labels.extend(vis_num.cpu().numpy())
             all_outputs2.extend(outputs2.cpu().numpy())
-    ave_mse=total_mse/ len(test_loader.dataset)
+
     epoch_loss = running_loss / len(test_loader.dataset)
     accuracy = correct / total
     # Calculate R2 score
     r2 = r2_score(all_labels, all_outputs2)
-    return epoch_loss, accuracy,r2,ave_mse
+    return epoch_loss, accuracy,r2
 
 def load_checkpoint(model, optimizer, checkpoint_path):
     checkpoint = torch.load(checkpoint_path)
@@ -311,11 +286,7 @@ def save_checkpoint(model, optimizer, epoch, loss, checkpoint_path):
     }, checkpoint_path)
 
 # 創建模型實例
-model = VisNet(sift_channels=5,flow_channels=2,rgb_channels=3,num_classes=3)
-# input_shape1 = (5, 3, 200, 600)
-# input_shape2 = (5, 3, 200, 600)
-# input_shape3 = (5, 3, 43,  128)
-# summary(model, input_data=(torch.randn(input_shape1), torch.randn(input_shape2), torch.randn(input_shape3)))
+model = ThreeStream(num_classes=3,optical_channels=2,sift_channels=3)
 pretrained_model_path=None
 # 計算模型參數量
 total_params = sum(p.numel() for p in model.parameters())
@@ -327,7 +298,6 @@ model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 criterion2 = nn.HuberLoss()
-criterion3 =nn.MSELoss()
 
 # lr=0.0001
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
@@ -339,20 +309,17 @@ best_accuracy = 0.0
 best_epoch = 0
 best_model_path = "best_model.pth"
 
-num_epochs = 120
+num_epochs = 100
 for epoch in range(num_epochs):
-
     train_loss = train(model, train_loader, criterion,criterion2, optimizer, device)
-    test_loss, test_accuracy,r2,ave_mse = test(model, test_loader, criterion,criterion2,criterion3, device)
+    test_loss, test_accuracy,r2 = test(model, test_loader, criterion,criterion2, device)
     # 在每個epoch結束時更新學習率
     #scheduler.step()
     print(
-        f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f},r2:{r2:.4f},mse:{ave_mse:.4f} ")
+        f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f},r2:{r2:.4f} ")
     if test_accuracy+r2> best_accuracy:
         best_accuracy = test_accuracy+r2
         best_epoch = epoch
-        save_checkpoint(model, optimizer, num_epochs, test_loss, best_model_path)
-        #torch.save(model.state_dict(), best_model_path)
+        #save_checkpoint(model, optimizer, num_epochs, test_loss, best_model_path)
+        torch.save(model.state_dict(), best_model_path)
         print(f"New best model saved with accuracy: {best_accuracy:.4f} at epoch {best_epoch + 1}")
-
-
