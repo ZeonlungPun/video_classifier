@@ -24,7 +24,7 @@ two stream implementation: two_stream.py
 # Environment
 
 Ubuntu 22.04, NVIDIA GeForce RTX 3070-Ti  
-"""
+'''
 albumentations                 1.3.1
 
 cvzone                         1.6.1
@@ -64,6 +64,6 @@ torchmetrics                   1.3.1
 
 torchvision                    0.17.2
 
-"""
+'''
 
 
