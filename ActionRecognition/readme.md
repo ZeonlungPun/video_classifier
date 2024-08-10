@@ -15,8 +15,6 @@ vedio classifier model (some pretrain models from torchvision.models.video modul
 
 # Demo
 
-https://github.com/user-attachments/assets/5248e2db-e97f-453e-98ab-e6c63ca3958b
 
-https://github.com/user-attachments/assets/70d5f85c-baae-497f-912d-4fb03d9fce29
 
 
