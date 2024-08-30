@@ -1,4 +1,4 @@
-import os,cv2,pretrainedmodels
+import os,cv2,pretrainedmodels,timm
 import torch,re
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -99,20 +99,7 @@ class CustomBranch(nn.Module):
             self.backbone.conv1 = nn.Conv2d(in_channel, 64, kernel_size=3, stride=2, padding=3, bias=False)
             num_ftrs = self.backbone.fc.in_features
             self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-        elif self.branch_name == 'ShuffleNetV2':
-            self.backbone = models.shufflenet_v2_x0_5(pretrained=True)
-            self.backbone.conv1[0]= nn.Conv2d(in_channel, 24, kernel_size=3, stride=2, padding=1, bias=False)
-            # 添加AdaptiveAvgPool2d以使輸出形狀固定
-            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-            num_ftrs = self.backbone.fc.in_features
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-        elif self.branch_name == 'MobileNetV2':
-            self.backbone = models.mobilenet_v2(pretrained=True)
-            self.backbone.features[0][0] = nn.Conv2d(in_channel, 32, kernel_size=3, stride=2, padding=1, bias=False)
-            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-            num_ftrs = self.backbone.classifier[1].in_features
-            # 保存特徵提取部分
-            self.feature_extractor = nn.Sequential(*list(self.backbone.features))
+        
 
         elif self.branch_name == 'VGG16':
             self.backbone = models.vgg16(pretrained=False)
@@ -120,13 +107,7 @@ class CustomBranch(nn.Module):
             num_ftrs = self.backbone.classifier[0].in_features
             # 保存特徵提取部分，直到自適應平均池化層之前
             self.feature_extractor = nn.Sequential(*list(self.backbone.features), nn.AdaptiveAvgPool2d((7, 7)))
-        elif self.branch_name == 'xception':
-            self.backbone = pretrainedmodels.__dict__['xception'](pretrained=None)
-            self.backbone.conv1 = nn.Conv2d(in_channel, 32, kernel_size=3, stride=2, padding=0, bias=False)
-            num_ftrs = self.backbone.last_linear.in_features
-            # 保存特徵提取部分，直到最後一層的全連接層之前
-            self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
-            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+       
         elif self.branch_name == 'densenet121':
             self.backbone = models.densenet121(pretrained=False)
             self.backbone.features.conv0 = nn.Conv2d(in_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
